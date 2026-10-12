@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<!-- Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cuVSLAM nightly KPI trends</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<style>
+  :root { --fg: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7; --accent: #76b900; --bg-side: #f5f5f7; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); }
+  header { display: flex; align-items: baseline; gap: 16px; padding: 10px 18px; border-bottom: 3px solid var(--accent); }
+  header h1 { font-size: 18px; margin: 0; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  header a { margin-left: auto; color: var(--fg); }
+  main { display: flex; min-height: calc(100vh - 50px); }
+  aside { width: 270px; flex: none; padding: 12px 14px; background: var(--bg-side); border-right: 1px solid var(--line);
+          overflow-y: auto; max-height: calc(100vh - 50px); position: sticky; top: 0; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 0 4px; }
+  aside h2 .all { float: right; font-weight: normal; text-transform: none; cursor: pointer; color: #0066cc; }
+  aside label { display: block; padding: 1px 0; cursor: pointer; white-space: nowrap; overflow: hidden;
+                text-overflow: ellipsis; }
+  aside select, aside input[type=date] { width: 100%; padding: 3px; }
+  aside button { margin-top: 12px; width: 100%; padding: 6px; cursor: pointer; }
+  #panels { flex: 1; display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 8px;
+            padding: 10px; align-content: start; }
+  .panel { border: 1px solid var(--line); border-radius: 6px; height: 360px; }
+  #empty { padding: 40px; color: var(--muted); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>cuVSLAM nightly KPI trends</h1>
+  <span class="meta" id="meta"></span>
+  <a href="../">Documentation</a>
+</header>
+<main>
+  <aside>
+    <h2>Panels</h2>
+    <select id="panel">
+      <option value="row">One per dataset / mode</option>
+      <option value="metric">One per metric</option>
+      <option value="config">One per configuration</option>
+    </select>
+    <h2>Configurations</h2>
+    <select id="combine">
+      <option value="each">Show each configuration</option>
+      <option value="mean">Combine (mean; max for counts)</option>
+    </select>
+    <div id="configs"></div>
+    <h2>Metrics <span class="all" data-group="metrics">all / none</span></h2>
+    <div id="metrics"></div>
+    <h2>Datasets <span class="all" data-group="datasets">all / none</span></h2>
+    <div id="datasets"></div>
+    <h2>Tracking types <span class="all" data-group="types">all / none</span></h2>
+    <div id="types"></div>
+    <h2>Modes</h2>
+    <div id="modes"></div>
+    <h2>Y axis</h2>
+    <select id="yaxis">
+      <option value="abs">Absolute value</option>
+      <option value="pct">% change vs series median</option>
+    </select>
+    <label><input type="checkbox" id="log"> Log scale</label>
+    <h2>Style</h2>
+    <select id="style">
+      <option value="lines+markers">Lines and markers</option>
+      <option value="lines">Lines</option>
+      <option value="markers">Markers</option>
+    </select>
+    <label><input type="checkbox" id="band"> Rolling baseline band</label>
+    <div class="hint">Median of the previous nightlies ± the regression band used by the nightly report; points
+      worse than the band are marked ✕.</div>
+    <h2>Dates</h2>
+    <input type="date" id="from"> <input type="date" id="to">
+    <button id="share">Copy link to this view</button>
+  </aside>
+  <section id="panels"></section>
+</main>
+<script>
+"use strict";
+const PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22",
+                 "#17becf", "#76b900", "#003f5c", "#bc5090", "#ffa600", "#58508d", "#ff6361"];
+const DEFAULTS = {panel: "row", combine: "each", yaxis: "abs", style: "lines+markers", log: false, band: false,
+                  metrics: ["ATE"], from: "", to: ""};
+const GROUPS = ["configs", "metrics", "datasets", "types", "modes"];
+let DATA, state, colorMap = new Map();
+
+const $ = (id) => document.getElementById(id);
+const median = (xs) => { const s = [...xs].sort((a, b) => a - b), m = s.length >> 1;
+                         return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+const splitMode = (mode) => { const i = mode.lastIndexOf("_"); return [mode.slice(0, i), mode.slice(i + 1)]; };
+
+function colorFor(name) {
+  if (!colorMap.has(name)) colorMap.set(name, PALETTE[colorMap.size % PALETTE.length]);
+  return colorMap.get(name);
+}
+
+function options() {
+  const kpis = Object.values(DATA.kpis);
+  const uniq = (f) => [...new Set(kpis.map(f))].sort();
+  return {
+    configs: Object.keys(DATA.configs).sort(),
+    metrics: Object.keys(DATA.metrics).filter((m) => kpis.some((k) => k.metric === m)),
+    datasets: uniq((k) => k.dataset),
+    types: uniq((k) => splitMode(k.mode)[0]),
+    modes: uniq((k) => splitMode(k.mode)[1]),
+  };
+}
+
+function readHash(opts) {
+  const p = new URLSearchParams(location.hash.slice(1));
+  const s = {...DEFAULTS};
+  for (const k of ["panel", "combine", "yaxis", "style", "from", "to"]) if (p.has(k)) s[k] = p.get(k);
+  for (const k of ["log", "band"]) if (p.has(k)) s[k] = p.get(k) === "1";
+  for (const g of GROUPS) {
+    s[g] = p.has(g) ? p.get(g).split(",").filter((v) => opts[g].includes(v)) : (DEFAULTS[g] || opts[g]);
+  }
+  return s;
+}
+
+function writeHash() {
+  const p = new URLSearchParams();
+  for (const k of ["panel", "combine", "yaxis", "style", "from", "to"]) if (state[k] !== DEFAULTS[k]) p.set(k, state[k]);
+  for (const k of ["log", "band"]) if (state[k]) p.set(k, "1");
+  for (const g of GROUPS) p.set(g, state[g].join(","));
+  history.replaceState(null, "", "#" + p.toString());
+}
+
+function buildControls(opts) {
+  for (const g of GROUPS) {
+    const box = $(g);
+    for (const v of opts[g]) {
+      const label = document.createElement("label"), input = document.createElement("input");
+      input.type = "checkbox"; input.value = v; input.checked = state[g].includes(v);
+      input.addEventListener("change", () => {
+        state[g] = [...box.querySelectorAll("input:checked")].map((i) => i.value); update();
+      });
+      label.append(input, " " + (g === "metrics" ? DATA.metrics[v].label : v));
+      label.title = v;
+      box.append(label);
+    }
+  }
+  document.querySelectorAll(".all").forEach((el) => el.addEventListener("click", () => {
+    const g = el.dataset.group, inputs = [...$(g).querySelectorAll("input")];
+    const on = inputs.some((i) => !i.checked);
+    inputs.forEach((i) => { i.checked = on; });
+    state[g] = on ? inputs.map((i) => i.value) : []; update();
+  }));
+  for (const k of ["panel", "combine", "yaxis", "style", "from", "to"]) {
+    $(k).value = state[k];
+    $(k).addEventListener("change", () => { state[k] = $(k).value; update(); });
+  }
+  for (const k of ["log", "band"]) {
+    $(k).checked = state[k];
+    $(k).addEventListener("change", () => { state[k] = $(k).checked; update(); });
+  }
+  $("share").addEventListener("click", async () => {
+    await navigator.clipboard.writeText(location.href);
+    $("share").textContent = "Link copied"; setTimeout(() => { $("share").textContent = "Copy link to this view"; }, 1500);
+  });
+}
+
+// One series per (KPI key, configuration), or per KPI key when configurations are combined.
+function collectSeries() {
+  const series = [];
+  for (const [key, kpi] of Object.entries(DATA.kpis)) {
+    const [type, mode] = splitMode(kpi.mode);
+    if (!state.metrics.includes(kpi.metric) || !state.datasets.includes(kpi.dataset) ||
+        !state.types.includes(type) || !state.modes.includes(mode)) continue;
+    const perConfig = state.configs.filter((c) => DATA.configs[c].values[key])
+      .map((c) => ({config: c, runs: DATA.configs[c].runs, values: DATA.configs[c].values[key]}));
+    if (!perConfig.length) continue;
+    if (state.combine === "mean") {
+      const byRun = new Map();
+      for (const s of perConfig) s.runs.forEach((r, i) => {
+        if (s.values[i] === null) return;
+        if (!byRun.has(r)) byRun.set(r, []);
+        byRun.get(r).push(s.values[i]);
+      });
+      const runs = [...byRun.keys()].sort();
+      const reduce = DATA.metrics[kpi.metric].count ? (xs) => Math.max(...xs)
+                                                   : (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+      series.push({key, kpi, config: `mean of ${perConfig.length}`, runs, values: runs.map((r) => reduce(byRun.get(r)))});
+    } else {
+      for (const s of perConfig) series.push({key, kpi, ...s});
+    }
+  }
+  return series;
+}
+
+function inRange(run) { return (!state.from || run >= state.from) && (!state.to || run <= state.to); }
+
+// Mirrors evaluate_baseline() in cuvslam_kpi_report.py for every point against the runs before it.
+function baselineBand(s) {
+  const settings = DATA.baseline.settings[s.kpi.dataset], meta = DATA.metrics[s.kpi.metric];
+  if (!settings) return null;
+  const lo = [], hi = [], worse = [];
+  s.values.forEach((v, i) => {
+    const window = s.values.slice(Math.max(0, i - settings.baseline_window), i).filter((x) => x !== null);
+    if (window.length < DATA.baseline.min_runs) { lo.push(null); hi.push(null); return; }
+    const center = median(window), mad = median(window.map((x) => Math.abs(x - center)));
+    let band = Math.max(settings.baseline_mad_k * mad, settings.baseline_min_pct / 100 * Math.abs(center));
+    if (meta.count) band = Math.max(band, 1);
+    lo.push(center - band); hi.push(center + band);
+    if (v !== null && (meta.higher_is_better ? center - v : v - center) > band) worse.push(i);
+  });
+  return {lo, hi, worse};
+}
+
+function panelOf(s) {
+  if (state.panel === "metric") return [s.kpi.metric, `${s.kpi.dataset}-${s.kpi.mode} · ${s.config}`];
+  if (state.panel === "config") return [s.config, `${s.kpi.dataset}-${s.kpi.mode} ${DATA.metrics[s.kpi.metric].label}`];
+  return [`${s.kpi.dataset}-${s.kpi.mode}`, `${DATA.metrics[s.kpi.metric].label} · ${s.config}`];
+}
+
+function panelTitle(panel) {
+  const meta = DATA.metrics[panel];
+  if (!meta) return panel;
+  const unit = state.yaxis === "pct" ? "% vs median" : meta.unit;
+  return `${meta.label}${unit ? ` (${unit})` : ""} — ${meta.higher_is_better ? "higher" : "lower"} is better`;
+}
+
+function tracesFor(s, name) {
+  const color = colorFor(name), idx = s.runs.map((r, i) => i).filter((i) => inRange(s.runs[i]));
+  const ref = state.yaxis === "pct" ? median(idx.map((i) => s.values[i]).filter((v) => v !== null)) : null;
+  const y = (v) => (v === null ? null : ref !== null ? (ref ? (v / ref - 1) * 100 : null) : v);
+  const x = idx.map((i) => s.runs[i]), unit = DATA.metrics[s.kpi.metric].unit;
+  const traces = [{
+    x, y: idx.map((i) => y(s.values[i])), name, mode: state.style, type: "scatter", line: {color, width: 1.6},
+    marker: {size: 5}, legendgroup: name, connectgaps: false,
+    customdata: idx.map((i) => s.values[i]),
+    hovertemplate: `%{x}<br>${name}<br>%{customdata:.4g} ${unit}<extra></extra>`,
+  }];
+  if (state.band) {
+    const b = baselineBand(s);
+    if (b) {
+      const common = {x, type: "scatter", mode: "lines", line: {width: 0, color}, legendgroup: name,
+                      showlegend: false, hoverinfo: "skip"};
+      traces.unshift({...common, y: idx.map((i) => y(b.lo[i]))},
+                     {...common, y: idx.map((i) => y(b.hi[i])), fill: "tonexty", fillcolor: color + "26"});
+      const worse = b.worse.filter((i) => inRange(s.runs[i]));
+      if (worse.length) {
+        traces.push({x: worse.map((i) => s.runs[i]), y: worse.map((i) => y(s.values[i])), type: "scatter",
+                     mode: "markers", marker: {symbol: "x", size: 10, color: "#d62728"}, legendgroup: name,
+                     showlegend: false, hovertemplate: `%{x}<br>${name}<br>outside baseline band<extra></extra>`});
+      }
+    }
+  }
+  return traces;
+}
+
+function syncX(divs) {
+  let syncing = false;
+  for (const div of divs) {
+    div.on("plotly_relayout", (ev) => {
+      if (syncing) return;
+      const range = ev["xaxis.range[0]"] !== undefined ? [ev["xaxis.range[0]"], ev["xaxis.range[1]"]]
+                  : ev["xaxis.autorange"] ? null : undefined;
+      if (range === undefined) return;
+      syncing = true;
+      Promise.all(divs.filter((d) => d !== div).map((d) => Plotly.relayout(d, range ? {"xaxis.range": range}
+                                                                                      : {"xaxis.autorange": true})))
+        .finally(() => { syncing = false; });
+    });
+  }
+}
+
+function update() {
+  writeHash();
+  const panels = new Map();
+  for (const s of collectSeries()) {
+    const [panel, name] = panelOf(s);
+    if (!panels.has(panel)) panels.set(panel, []);
+    panels.get(panel).push(...tracesFor(s, name));
+  }
+  const root = $("panels");
+  root.querySelectorAll(".panel").forEach((d) => Plotly.purge(d));
+  root.replaceChildren();
+  if (!panels.size) {
+    const p = document.createElement("div"); p.id = "empty"; p.textContent = "No KPIs match the current filters.";
+    root.append(p); return;
+  }
+  const divs = [];
+  for (const [panel, traces] of [...panels].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const div = document.createElement("div"); div.className = "panel"; root.append(div); divs.push(div);
+    Plotly.newPlot(div, traces, {
+      title: {text: panelTitle(panel), font: {size: 14}, x: 0.01, xanchor: "left"}, margin: {l: 55, r: 10, t: 36, b: 40},
+      xaxis: {type: "date", tickformat: "%b %d"},
+      yaxis: {type: state.log && state.yaxis === "abs" ? "log" : "linear", zeroline: state.yaxis === "pct"},
+      legend: {font: {size: 10}, orientation: "h", y: -0.18}, hovermode: "closest",
+    }, {responsive: true, displaylogo: false, displayModeBar: "hover"});
+  }
+  syncX(divs);
+}
+
+async function main() {
+  DATA = await (await fetch("data.json", {cache: "no-cache"})).json();
+  const runs = Object.values(DATA.configs).flatMap((c) => c.runs).sort();
+  $("meta").textContent = `${Object.keys(DATA.configs).length} configurations · nightlies ${runs[0]} to ` +
+                          `${runs[runs.length - 1]} · generated ${DATA.generated}`;
+  const opts = options();
+  state = readHash(opts);
+  buildControls(opts);
+  update();
+}
+main().catch((e) => { $("panels").textContent = `Failed to load KPI data: ${e}`; });
+</script>
+</body>
+</html>
