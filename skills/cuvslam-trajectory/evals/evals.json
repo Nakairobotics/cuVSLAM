@@ -80,7 +80,7 @@
       "prompt": "Compare /workspace/input/offset-estimate.txt (cam0) with /workspace/input/valid-tum.txt (body) as synthetic TUM trajectories, meters/seconds/xyzw in different right-handed world frames. I have no extrinsics: provide only a provisional comparison using the first 2 seconds for initial pose alignment and explain its limits. Save under /workspace/output/provisional. Do not replay.",
       "expected_output": "An explicit missing-extrinsics fallback uses a fixed initial 2-second window (3 pairs), labels results provisional, and explains that world alignment cannot generally recover the missing camera/body extrinsic even when the fitted errors are small.",
       "assertions": [
-        "Read references/evaluation.md and use --allow-missing-extrinsics with --alignment-window 2.",
+        "Read references/evaluation.md and use --allow-missing-extrinsics with --alignment initial-poses --alignment-window 2.",
         "State the missing physical-frame relationship and preserve the provisional limitation.",
         "Do not claim calibration recovery or bootstrap/replay cuVSLAM."
       ],

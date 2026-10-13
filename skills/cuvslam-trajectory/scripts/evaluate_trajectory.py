@@ -226,6 +226,9 @@ def sensor_matrix(path: Path) -> np.ndarray:
 def frame_conversion(args: argparse.Namespace) -> tuple[np.ndarray, list[dict], list[str]]:
     """Return T_estimate_sensor_from_gt_sensor, for right multiplication of estimates."""
     sources, warnings = [], []
+    if args.alignment != "none" and not args.allow_missing_extrinsics:
+        raise ValueError("world alignment is reserved for --allow-missing-extrinsics; "
+                         "use --alignment none with available calibration or a known same-sensor frame")
     yaml_paths = (args.estimate_sensor_yaml, args.gt_sensor_yaml)
     if args.allow_missing_extrinsics and args.estimate_frame == args.gt_frame:
         raise ValueError("missing-extrinsics fallback requires different physical frames")
@@ -277,11 +280,12 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[tuple]]:
     diagnostics = {}
     transform = np.eye(4)
     if args.alignment != "none":
-        fit_ids = (np.arange(len(est_ids)) if args.alignment == "all-positions" else
-                   np.flatnonzero(matched_times - matched_times[0] <= window_ns))
+        fit_ids = np.flatnonzero(matched_times - matched_times[0] <= window_ns)
         transform, diagnostics = fit_alignment(matched_est[fit_ids], matched_gt[fit_ids], args.alignment)
     elif args.estimate_world != args.gt_world:
-        raise ValueError("--alignment none requires the same declared world frame")
+        warnings.append("PROVISIONAL: world frames differ and no world alignment was applied. "
+                        "Extrinsic conversion alone does not establish a shared world; these unaligned "
+                        "ATE/ARE residuals include the unresolved world offset and are not isolated tracking accuracy.")
     translation, rotation = pose_errors(transform @ matched_est, matched_gt)
     # Use all native GT samples between matched endpoints, not just downsampled matches.
     distance = float(np.linalg.norm(np.diff(gt.poses[gt_ids[0]:gt_ids[-1] + 1, :3, 3], axis=0), axis=1).sum())
@@ -293,12 +297,10 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[tuple]]:
                          "initial positions set the origin without fitting later drift.",
         "initial-positions": "Initial positions set the world frame without fitting later drift; "
                              "non-collinearity is required.",
-        "all-positions": "Global position least squares measures error after fitting the entire evaluated interval; "
-                         "this may hide some drift relative to initial-window alignment.",
-        "none": "Inputs are declared to use the same world frame; no alignment is applied.",
+        "none": "Apply the calibrated or known identity physical-frame conversion only; no world alignment.",
     }
     report = {
-        "schema_version": 1, "status": "provisional" if args.allow_missing_extrinsics and warnings else "ok",
+        "schema_version": 1, "status": "provisional" if any(warning.startswith("PROVISIONAL:") for warning in warnings) else "ok",
         "inputs": {
             "estimate": {**file_record(args.estimate), "format": args.estimate_format},
             "ground_truth": {**file_record(args.ground_truth), "format": args.gt_format},
@@ -313,7 +315,8 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[tuple]]:
             "estimate_world": args.estimate_world, "gt_world": args.gt_world,
             "evaluation_sensor": args.gt_frame if not args.allow_missing_extrinsics else "unresolved (see warnings)",
             "estimate_from_gt": conversion.tolist(), "calibration_sources": calibration,
-            "conversion_rule": "T_W_E @ T_E_G; then T_Wgt_West @ converted_estimate",
+            "conversion_rule": ("T_W_E @ T_E_G; no world alignment" if args.alignment == "none" else
+                                "identity physical-frame assumption; then T_Wgt_West @ estimate"),
         },
         "association": {
             "method": "all candidate pairs sorted by (absolute dt, estimate index, GT index); greedy one-to-one; "
@@ -325,10 +328,11 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[tuple]]:
         },
         "alignment": {
             "method": args.alignment, "scale": 1.0, "rationale": args.alignment_reason or reasons[args.alignment],
+            "policy": "missing-extrinsics-fallback" if args.allow_missing_extrinsics else "extrinsics-only",
             "requested_initial_window_seconds": window_ns / 1e9 if args.alignment.startswith("initial") else None,
             "fit_pose_count": len(fit_ids), "fit_start_ns": int(matched_times[fit_ids[0]]) if len(fit_ids) else None,
             "fit_end_ns": int(matched_times[fit_ids[-1]]) if len(fit_ids) else None,
-            "fit_poses_included_in_metrics": True, "gt_world_from_estimate_world": transform.tolist(),
+            "fit_poses_included_in_metrics": bool(len(fit_ids)), "gt_world_from_estimate_world": transform.tolist(),
             **diagnostics,
         },
         "metrics": {
@@ -337,8 +341,8 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[tuple]]:
             "gt_traveled_distance_m": distance,
         },
         "metric_definitions": {
-            "ate_rmse_m": "sqrt(mean(||p_est_aligned - p_gt||^2))",
-            "are_rmse_deg": "sqrt(mean(angle(R_gt.T @ R_est_aligned)^2)), angles in [0,180] degrees",
+            "ate_rmse_m": "sqrt(mean(||p_est_evaluated - p_gt||^2))",
+            "are_rmse_deg": "sqrt(mean(angle(R_gt.T @ R_est_evaluated)^2)), angles in [0,180] degrees",
             "normalized_ate_rmse_percent": "100 * ate_rmse_m / gt_traveled_distance_m; null for zero distance",
             "gt_traveled_distance_m": "sum of distances between ALL consecutive native GT positions from "
                                       "first to last matched GT timestamp, in the GT physical frame",
@@ -372,8 +376,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-missing-extrinsics", action="store_true", help="explicit provisional initial-window fallback")
     parser.add_argument("--time-offset", default="0", help="seconds ADDED to estimate times; no automatic clock fitting")
     parser.add_argument("--max-time-difference", default="0.01", help="association tolerance, seconds (default: 0.01)")
-    parser.add_argument("--alignment", choices=("initial-poses", "initial-positions", "all-positions", "none"),
-                        default="initial-poses")
+    parser.add_argument("--alignment", choices=("none", "initial-poses", "initial-positions"), default="none",
+                        help="default: none; initial-window alignment requires --allow-missing-extrinsics")
     parser.add_argument("--alignment-window", default="1.0", help="seconds from first matched estimate, inclusive; min 3 pairs")
     parser.add_argument("--alignment-reason", help="rationale for the selected alignment")
     parser.add_argument("--output-dir", type=Path, required=True, help="write evaluation.json and errors.csv; never overwrite")

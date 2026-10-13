@@ -33,11 +33,18 @@ Do not invent uniformly spaced timestamps.
 
 ```text
 converted estimate = T_We_E @ T_E_G
-aligned estimate   = T_Wg_We @ converted estimate
+compare converted estimate with GT directly (--alignment none)
 ```
 
-The first operation is a sensor/body conversion on the **right**, using the full rotation and lever-arm translation.
-The second is a world alignment on the **left**. They solve different problems.
+Sensor/body conversion multiplies on the **right**, using the full rotation and lever-arm translation.
+When calibration is available, this skill uses that conversion alone: **do not apply world alignment**,
+including an initial-pose reset or a separate global fit. Known identical physical frames also use no alignment.
+World alignment is reserved for the explicit missing-extrinsics fallback described below.
+
+This is an evaluation policy, not a claim that extrinsics establish the world registration. If the estimate and
+GT have different worlds, the unaligned residual includes that world offset. Preserve their actual world labels
+and report the helper's provisional result and limitation; do not present it as isolated tracking accuracy or
+silently add an alignment to obtain smaller errors.
 
 For two calibration files whose `T_BS` matrices both refer to the same physical reference B:
 
@@ -70,13 +77,15 @@ python3 <skill-dir>/scripts/evaluate_trajectory.py \
     --gt-world 'EuRoC ground-truth world, right-handed' \
     --estimate-sensor-yaml /data/rec_05/mav0/cam0/sensor.yaml \
     --gt-sensor-yaml /data/rec_05/mav0/imu0/sensor.yaml \
-    --alignment initial-poses --alignment-window 1.0 \
+    --alignment none \
     --output-dir /data/rec_05/evaluation
 ```
 
-If extrinsics cannot be found or derived, explain the missing relationship. A provisional initial-window comparison
-can use `--allow-missing-extrinsics`, which explicitly assumes identity for the missing conversion and emits a
-`provisional` status and limitation. One world transform cannot generally replace a camera/body transform: a
+Only if the required extrinsics cannot be found or derived, explain the missing relationship and use
+`--allow-missing-extrinsics --alignment initial-poses --alignment-window 1.0` for a provisional initial-window
+comparison. This explicitly assumes identity for the missing conversion and emits a `provisional` status and
+limitation. The helper rejects world alignment when calibrated conversion or a known same-sensor relationship
+is available. Do not omit available calibration to enable this fallback. One world transform cannot generally replace a camera/body transform: a
 lever arm moves with sensor rotation, and a missing orientation extrinsic also produces motion-dependent error.
 Do not present these numbers as isolated tracking accuracy or claim the fit recovered the calibration. In an
 already calibrated dataset, failure to inspect available extrinsics is not a justification for this fallback.
@@ -96,36 +105,35 @@ A short common interval does not establish full recording coverage. Alignment po
 `errors.csv` records the matched row indices (zero-based, excluding comments), corrected estimate and GT times,
 time differences, translation errors, and rotation errors.
 
-## World alignment and scale
+## Alignment policy and scale
 
-Always state why the selected alignment is suitable. All helper modes keep scale exactly 1; stereo/inertial output
-is metric. Do not use similarity/Sim(3) fitting to hide scale error. If the user explicitly requests scale fitting
-for a scale-ambiguous monocular trajectory, use a separately documented calculation and report the fitted scale.
+`--alignment none` is the default. With available extrinsics, apply only the physical-frame conversion, associate
+poses, and compute the metrics. Do not first reset the trajectories, fit their first poses/window, fit the entire
+trajectory, or optimize scale. With the same verified physical frame, use the identity conversion and no alignment.
 
-| `--alignment` | Method and validity |
+Keep the estimate's and GT's actual world-frame labels. For `none`, matching labels declare a verified shared
+world. Different labels are accepted so the requested extrinsics-only residuals can be computed, but the report
+is `provisional` and warns that those values include an unresolved world offset. Do not change labels merely to
+make the report `ok`. Sensor extrinsics alone do not determine the world-to-world transform.
+
+World alignment is available **only with `--allow-missing-extrinsics`**, after establishing that the required
+physical-frame transform is unavailable. Both fallback modes keep scale exactly 1:
+
+| `--alignment` | Missing-extrinsics fallback method |
 | --- | --- |
-| `initial-poses` (default) | Mean of `R_gt @ R_est.T`, projected onto SO(3) by SVD; translation is `mean(p_gt - R_align @ p_est)`. Requires at least 3 pairs and a non-singular, positive-determinant orientation mean. |
-| `initial-positions` | Rigid Kabsch fit on initial positions; requires at least 3 pairs and at least 2 independent centered position directions. |
-| `all-positions` | The same rigid position fit over all evaluated pairs; useful for conventional globally aligned ATE, but may absorb some accumulated drift. |
-| `none` | Identity world transform; declare the same verified world convention for both inputs. |
+| `initial-poses` | Mean of `R_gt @ R_est.T`, projected onto SO(3) by SVD; translation is `mean(p_gt - R_align @ p_est)`. Uses orientations even at rest or on a straight line. |
+| `initial-positions` | Rigid Kabsch fit on initial positions; requires at least 2 independent centered position directions. |
 
-For either initial method, `--alignment-window` defaults to **1.0 seconds from the first matched estimate timestamp,
-inclusive**. Report the requested duration, actual first/last fit timestamps, count, rationale, fitted matrix,
-singular values, and translation/rotation fit RMSE. The pose method minimizes rotational matrix discrepancy, then
-translation residual; it is not a position-only Kabsch fit. Orientations determine its rotation even at rest or on
-a straight line. The position methods reject stationary/collinear or nearly rank-one motion (second/first singular
-value below 1e-6; leading value below 1e-12 square meters). The orientation mean rejects a smallest singular value
-below 1e-6 or a nonpositive determinant.
-
-Numerical validity alone does not establish that a fit is meaningful. Inspect residuals for frame, timing, and
-initialization errors. An initial fit based on unstable tracking or an unsuitable window needs a documented reason
-to change the window/method; do not silently increase it until error looks good. Apply the resulting **one fixed
-transform** to every evaluated pose. Do not continually realign, align position and orientation with different
-world transforms, or use a first-pose orientation reset as a substitute for calibrated sensor conversion.
+Use a declared initial window, normally `--alignment-window 1.0` seconds from the first matched estimate timestamp,
+inclusive. At least 3 pairs are required. Inspect fit residuals and conditioning, and record the actual fit count,
+interval, matrix, and rationale. Apply one fixed transform to all evaluated poses; do not continually realign or
+increase the window to improve the reported error. A fallback fit remains provisional because it does not recover
+a missing camera/body extrinsic or isolate tracking error. Similarity/Sim(3) scale fitting is not supported.
 
 ## Metrics and output
 
-Follow the user's requested definitions. The helper computes these absolute errors after conversion and alignment:
+Follow the user's requested definitions. Compute these errors after calibrated conversion alone, or after the
+explicit missing-extrinsics fallback. With unresolved world frames or extrinsics, label them provisional residuals:
 
 | Output | Definition |
 | --- | --- |

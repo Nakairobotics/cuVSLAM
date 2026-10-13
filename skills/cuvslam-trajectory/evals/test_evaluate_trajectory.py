@@ -108,10 +108,39 @@ class EvaluationTests(unittest.TestCase):
     def test_missing_extrinsics_are_explicit(self):
         with self.assertRaisesRegex(ValueError, "different physical frames"):
             evaluation.frame_conversion(self.args("--gt-frame", "imu0"))
-        _, _, warnings = evaluation.frame_conversion(self.args("--gt-frame", "imu0", "--allow-missing-extrinsics"))
+        _, _, warnings = evaluation.frame_conversion(self.args("--gt-frame", "imu0", "--allow-missing-extrinsics",
+                                                             "--alignment", "initial-poses"))
         self.assertIn("cannot generally recover", warnings[0])
         with self.assertRaisesRegex(ValueError, "initial-window"):
             evaluation.frame_conversion(self.args("--gt-frame", "imu0", "--allow-missing-extrinsics", "--alignment", "none"))
+
+    def test_calibrated_default_applies_extrinsic_without_world_fit(self):
+        # Camera-to-body conversion has both a 90-degree rotation and a lever arm.
+        self.write("estimate.txt", "0 0 0 0 0 0 0 1\n1 1 0 0 0 0 0 1\n2 2 0 0 0 0 0 1\n")
+        half = np.sqrt(0.5)
+        self.write("gt.txt", "".join(f"{i} {i + 3} 0 0 0 0 {half} {half}\n" for i in range(3)))
+        transform = self.write("extrinsic.json", json.dumps(pose(90, (3, 0, 0)).tolist()))
+        args = self.args("--gt-frame", "body", "--estimate-from-gt", str(transform))
+        report, _ = evaluation.evaluate(args)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["alignment"]["method"], "none")
+        self.assertEqual(report["alignment"]["fit_pose_count"], 0)
+        self.assertAlmostEqual(report["metrics"]["ate_rmse_m"], 0)
+        self.assertAlmostEqual(report["metrics"]["are_rmse_deg"], 0)
+        # A known world offset stays in the error; calibration must not trigger a fit.
+        self.write("gt.txt", "".join(f"{i} {i + 8} 0 0 0 0 {half} {half}\n" for i in range(3)))
+        args.gt_world = "different-world"
+        report, _ = evaluation.evaluate(args)
+        self.assertEqual(report["status"], "provisional")
+        self.assertAlmostEqual(report["metrics"]["ate_rmse_m"], 5)
+        np.testing.assert_array_equal(report["alignment"]["gt_world_from_estimate_world"], np.eye(4))
+        for method in ("initial-poses", "initial-positions"):
+            args.alignment = method
+            with self.subTest(method=method), self.assertRaisesRegex(ValueError, "reserved"):
+                evaluation.evaluate(args)
+        args.allow_missing_extrinsics = True
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            evaluation.evaluate(args)
 
     def test_association_overlap_tolerance_ties_and_uniqueness(self):
         estimated = np.array([0, 10, 20, 30, 40])
@@ -180,20 +209,25 @@ class EvaluationTests(unittest.TestCase):
     def test_initial_window_is_fixed_and_late_drift_remains(self):
         self.write("estimate.txt", "0 0 0 0 0 0 0 1\n0.5 1 0 0 0 0 0 1\n1 2 0 0 0 0 0 1\n2 13 0 0 0 0 0 1\n")
         self.write("gt.txt", "0 0 0 0 0 0 0 1\n0.5 1 0 0 0 0 0 1\n1 2 0 0 0 0 0 1\n2 3 0 0 0 0 0 1\n")
-        report, errors = evaluation.evaluate(self.args())
+        report, errors = evaluation.evaluate(self.args("--gt-frame", "imu0", "--allow-missing-extrinsics",
+                                                        "--alignment", "initial-poses"))
+        self.assertEqual(report["status"], "provisional")
         self.assertEqual(report["alignment"]["fit_pose_count"], 3)
         self.assertEqual(report["alignment"]["fit_end_ns"], 10**9)
         self.assertAlmostEqual(report["metrics"]["ate_rmse_m"], 5)
         self.assertEqual(errors[-1][-2], 10)
 
-    def test_time_offset_and_none_world_guard(self):
+    def test_time_offset_and_unaligned_world_warning(self):
         self.write("estimate.txt", "0 0 0 0 0 0 0 1\n1 1 0 0 0 0 0 1\n2 2 0 0 0 0 0 1\n")
         self.write("gt.txt", "10 0 0 0 0 0 0 1\n11 1 0 0 0 0 0 1\n12 2 0 0 0 0 0 1\n")
         report, _ = evaluation.evaluate(self.args("--time-offset", "10", "--alignment", "none"))
         self.assertEqual(report["metrics"]["ate_rmse_m"], 0)
         self.assertEqual(report["association"]["estimate_time_offset_ns"], 10**10)
-        with self.assertRaisesRegex(ValueError, "same declared world"):
-            evaluation.evaluate(self.args("--time-offset", "10", "--alignment", "none", "--gt-world", "other"))
+        report, _ = evaluation.evaluate(self.args("--time-offset", "10", "--gt-world", "other"))
+        self.assertEqual(report["status"], "provisional")
+        self.assertIn("unresolved world offset", report["warnings"][0])
+        self.assertEqual(report["alignment"]["fit_pose_count"], 0)
+        np.testing.assert_array_equal(report["alignment"]["gt_world_from_estimate_world"], np.eye(4))
 
     def test_kitti_timestamps_and_se3_validation(self):
         matrix = "1 0 0 0 0 1 0 0 0 0 1 0\n"
