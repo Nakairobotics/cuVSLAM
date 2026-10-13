@@ -25,8 +25,9 @@
   aside button { margin-top: 12px; width: 100%; padding: 6px; cursor: pointer; }
   #panels { flex: 1; display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 8px;
             padding: 10px; align-content: start; }
-  .panel { border: 1px solid var(--line); border-radius: 6px; height: 360px; }
+  .panel { border: 1px solid var(--line); border-radius: 6px; }
   #empty { padding: 40px; color: var(--muted); }
+  #error { padding: 40px; color: #b00020; max-width: 760px; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
 </style>
 </head>
@@ -44,6 +45,22 @@
       <option value="metric">One per metric</option>
       <option value="config">One per configuration</option>
     </select>
+    <h2>Layout</h2>
+    <select id="columns">
+      <option value="auto">Columns: auto</option>
+      <option value="1">1 column</option>
+      <option value="2">2 columns</option>
+      <option value="3">3 columns</option>
+      <option value="4">4 columns</option>
+    </select>
+    <select id="height">
+      <option value="auto">Height: auto</option>
+      <option value="260">Small</option>
+      <option value="360">Medium</option>
+      <option value="540">Large</option>
+      <option value="fill">Fill screen</option>
+    </select>
+    <div class="hint">Auto uses one full-screen chart when only one panel is left.</div>
     <h2>Configurations</h2>
     <select id="combine">
       <option value="each">Show each configuration</option>
@@ -70,6 +87,9 @@
       <option value="lines">Lines</option>
       <option value="markers">Markers</option>
     </select>
+    <label><input type="checkbox" id="gaps"> Connect across missing values</label>
+    <div class="hint">A gap means the nightly ran but produced no value for that KPI. Nights without a nightly
+      run have no point and are always connected.</div>
     <label><input type="checkbox" id="band"> Rolling baseline band</label>
     <div class="hint">Median of the previous nightlies ± the regression band used by the nightly report; points
       worse than the band are marked ✕.</div>
@@ -83,9 +103,13 @@
 "use strict";
 const PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22",
                  "#17becf", "#76b900", "#003f5c", "#bc5090", "#ffa600", "#58508d", "#ff6361"];
-const DEFAULTS = {panel: "row", combine: "each", yaxis: "abs", style: "lines+markers", log: false, band: false,
-                  metrics: ["ATE"], from: "", to: ""};
+const DEFAULTS = {panel: "row", columns: "auto", height: "auto", combine: "each", yaxis: "abs", style: "lines+markers",
+                  log: false, gaps: false, band: false, metrics: ["ATE"], from: "", to: ""};
+const SELECTS = ["panel", "columns", "height", "combine", "yaxis", "style", "from", "to"];
+const TOGGLES = ["log", "gaps", "band"];
 const GROUPS = ["configs", "metrics", "datasets", "types", "modes"];
+// Header height plus the panel grid padding, so a "fill" chart fits the window without scrolling.
+const FILL_OFFSET_PX = 72;
 let DATA, state, colorMap = new Map();
 
 const $ = (id) => document.getElementById(id);
@@ -113,8 +137,8 @@ function options() {
 function readHash(opts) {
   const p = new URLSearchParams(location.hash.slice(1));
   const s = {...DEFAULTS};
-  for (const k of ["panel", "combine", "yaxis", "style", "from", "to"]) if (p.has(k)) s[k] = p.get(k);
-  for (const k of ["log", "band"]) if (p.has(k)) s[k] = p.get(k) === "1";
+  for (const k of SELECTS) if (p.has(k)) s[k] = p.get(k);
+  for (const k of TOGGLES) if (p.has(k)) s[k] = p.get(k) === "1";
   for (const g of GROUPS) {
     s[g] = p.has(g) ? p.get(g).split(",").filter((v) => opts[g].includes(v)) : (DEFAULTS[g] || opts[g]);
   }
@@ -123,8 +147,8 @@ function readHash(opts) {
 
 function writeHash() {
   const p = new URLSearchParams();
-  for (const k of ["panel", "combine", "yaxis", "style", "from", "to"]) if (state[k] !== DEFAULTS[k]) p.set(k, state[k]);
-  for (const k of ["log", "band"]) if (state[k]) p.set(k, "1");
+  for (const k of SELECTS) if (state[k] !== DEFAULTS[k]) p.set(k, state[k]);
+  for (const k of TOGGLES) if (state[k]) p.set(k, "1");
   for (const g of GROUPS) p.set(g, state[g].join(","));
   history.replaceState(null, "", "#" + p.toString());
 }
@@ -149,11 +173,11 @@ function buildControls(opts) {
     inputs.forEach((i) => { i.checked = on; });
     state[g] = on ? inputs.map((i) => i.value) : []; update();
   }));
-  for (const k of ["panel", "combine", "yaxis", "style", "from", "to"]) {
+  for (const k of SELECTS) {
     $(k).value = state[k];
     $(k).addEventListener("change", () => { state[k] = $(k).value; update(); });
   }
-  for (const k of ["log", "band"]) {
+  for (const k of TOGGLES) {
     $(k).checked = state[k];
     $(k).addEventListener("change", () => { state[k] = $(k).checked; update(); });
   }
@@ -230,7 +254,7 @@ function tracesFor(s, name) {
   const x = idx.map((i) => s.runs[i]), unit = DATA.metrics[s.kpi.metric].unit;
   const traces = [{
     x, y: idx.map((i) => y(s.values[i])), name, mode: state.style, type: "scatter", line: {color, width: 1.6},
-    marker: {size: 5}, legendgroup: name, connectgaps: false,
+    marker: {size: 5}, legendgroup: name, connectgaps: state.gaps,
     customdata: idx.map((i) => s.values[i]),
     hovertemplate: `%{x}<br>${name}<br>%{customdata:.4g} ${unit}<extra></extra>`,
   }];
@@ -238,7 +262,7 @@ function tracesFor(s, name) {
     const b = baselineBand(s);
     if (b) {
       const common = {x, type: "scatter", mode: "lines", line: {width: 0, color}, legendgroup: name,
-                      showlegend: false, hoverinfo: "skip"};
+                      showlegend: false, hoverinfo: "skip", connectgaps: state.gaps};
       traces.unshift({...common, y: idx.map((i) => y(b.lo[i]))},
                      {...common, y: idx.map((i) => y(b.hi[i])), fill: "tonexty", fillcolor: color + "26"});
       const worse = b.worse.filter((i) => inRange(s.runs[i]));
@@ -283,9 +307,15 @@ function update() {
     const p = document.createElement("div"); p.id = "empty"; p.textContent = "No KPIs match the current filters.";
     root.append(p); return;
   }
+  const single = panels.size === 1;
+  const columns = state.columns === "auto" ? (single ? "1" : "") : state.columns;
+  root.style.gridTemplateColumns = columns ? `repeat(${columns}, minmax(0, 1fr))` : "";
+  const height = state.height === "auto" ? (single ? "fill" : "360") : state.height;
+  const panelHeight = height === "fill" ? `calc(100vh - ${FILL_OFFSET_PX}px)` : `${height}px`;
   const divs = [];
   for (const [panel, traces] of [...panels].sort((a, b) => a[0].localeCompare(b[0]))) {
-    const div = document.createElement("div"); div.className = "panel"; root.append(div); divs.push(div);
+    const div = document.createElement("div"); div.className = "panel"; div.style.height = panelHeight;
+    root.append(div); divs.push(div);
     Plotly.newPlot(div, traces, {
       title: {text: panelTitle(panel), font: {size: 14}, x: 0.01, xanchor: "left"}, margin: {l: 55, r: 10, t: 36, b: 40},
       xaxis: {type: "date", tickformat: "%b %d"},
@@ -296,8 +326,32 @@ function update() {
   syncX(divs);
 }
 
+function showError(message) {
+  const p = document.createElement("div"); p.id = "error"; p.textContent = message;
+  $("panels").replaceChildren(p);
+}
+
+async function loadData() {
+  try {
+    const response = await fetch("data.json", {cache: "no-cache"});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+  } catch (e) {
+    const hint = location.protocol === "file:"
+      ? " Browsers block reading data.json from a page opened as a file; serve the site over HTTP, for example" +
+        " with python3 -m http.server in the site directory."
+      : "";
+    throw new Error(`Failed to load KPI data (data.json): ${e.message}.${hint}`);
+  }
+}
+
 async function main() {
-  DATA = await (await fetch("data.json", {cache: "no-cache"})).json();
+  if (typeof Plotly === "undefined") {
+    showError("Failed to load the Plotly charting library from cdn.plot.ly. Check the network connection and any " +
+              "content blockers, then reload the page.");
+    return;
+  }
+  DATA = await loadData();
   const runs = Object.values(DATA.configs).flatMap((c) => c.runs).sort();
   $("meta").textContent = `${Object.keys(DATA.configs).length} configurations · nightlies ${runs[0]} to ` +
                           `${runs[runs.length - 1]} · generated ${DATA.generated}`;
@@ -306,7 +360,7 @@ async function main() {
   buildControls(opts);
   update();
 }
-main().catch((e) => { $("panels").textContent = `Failed to load KPI data: ${e}`; });
+main().catch((e) => showError(e.message));
 </script>
 </body>
 </html>
