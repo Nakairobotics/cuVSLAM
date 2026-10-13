@@ -27,6 +27,7 @@ enum class SlamDatabaseSingleton {
   SpatialIndex = 1,
   PoseGraph = 2,
   PoseGraphHypothesis = 3,
+  VprMap = 4,
 };
 // Interface for slam database
 //
@@ -34,6 +35,7 @@ enum class SlamDatabaseSingleton {
 // PoseGraph nodes and edges
 // Landmarks
 // Spatial index as blob
+// VPR map as blob
 class ISlamDatabase {
 public:
   // key of tables
@@ -66,6 +68,12 @@ public:
   bool GetSingleton(SlamDatabaseSingleton id, const FUNC& func) const {
     std::function<bool(const BlobReader&)> std_func(func);
     return GetRecordV(SlamDatabaseTable::Singletons, static_cast<Key>(id), std_func);
+  }
+  // Don't show error message if the singleton was not found
+  template <class FUNC>
+  bool TryGetSingleton(SlamDatabaseSingleton id, const FUNC& func) const {
+    std::function<bool(const BlobReader&)> std_func(func);
+    return GetRecordV(SlamDatabaseTable::Singletons, static_cast<Key>(id), std_func, true);
   }
 
   template <class FUNC>

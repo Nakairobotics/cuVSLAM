@@ -82,9 +82,10 @@ void AddFakeKeyframeForLastTailPose(LocalizerAndMapper& slam, const Tail& tail) 
 }  // namespace
 
 // Should be very fast. Just put task to the queue to not block main thread.
-void AsyncSlam::LocalizeInMap(const std::string_view& folder_name, int64_t timestamp_ns, const Isometry3T& guess_pose,
-                              const sof::Images& images, const Slam::LocalizationSettings& settings,
-                              Slam::LocalizeStartCB start_cb, Slam::LocalizeFinishCB finish_cb) {
+void AsyncSlam::LocalizeInMap(const std::string_view& folder_name, int64_t timestamp_ns,
+                              const std::optional<Isometry3T>& guess_pose, const sof::Images& images,
+                              const Slam::LocalizationSettings& settings, Slam::LocalizeStartCB start_cb,
+                              Slam::LocalizeFinishCB finish_cb) {
   const auto cmd =
       std::make_shared<LocalizeInMapCmd>(folder_name, timestamp_ns, guess_pose, images, settings, start_cb, finish_cb);
   const auto vo_keyframe = std::make_shared<VOKeyframeInfo>(VOKeyframeInfo());
@@ -97,7 +98,7 @@ void AsyncSlam::LocalizeInMap(const std::string_view& folder_name, int64_t times
 
 // This constructor should be very fast - all work should be offloaded to ::Execute
 AsyncSlam::LocalizeInMapCmd::LocalizeInMapCmd(const std::string_view& folder_name, int64_t timestamp_ns,
-                                              const Isometry3T& guess_pose, const sof::Images& images,
+                                              const std::optional<Isometry3T>& guess_pose, const sof::Images& images,
                                               const Slam::LocalizationSettings& settings,
                                               Slam::LocalizeStartCB start_cb, Slam::LocalizeFinishCB finish_cb)
     : folder_name_(folder_name),
@@ -122,6 +123,7 @@ void AsyncSlam::LocalizeInMapCmd::Execute(AsyncSlam& async_slam, FrameId, const 
     options.horizontal_step = settings_.horizontal_step;
     options.vertical_step = settings_.vertical_step;
     options.angle_step_rads = settings_.angular_step_rads;
+    options.vpr_options = async_slam.options_.vpr_options;
   }
 
   // TODO: keep localizer to safe memory
@@ -130,8 +132,20 @@ void AsyncSlam::LocalizeInMapCmd::Execute(AsyncSlam& async_slam, FrameId, const 
   CALLBACK_AND_RETURN_IF(!localizer->OpenDatabase(std::string{folder_name_}), finish_cb_, Pose,
                          "Failed to open database.");
 
+  // Without a guess, place recognition proposes the candidate poses to verify.
+  std::vector<Isometry3T> guess_poses;
+  if (guess_pose_.has_value()) {
+    guess_poses.push_back(*guess_pose_);
+  } else {
+    guess_poses = localizer->RecognizePlaces(images_, settings_.vpr_candidates);
+    localizer->UseRecognizedPlaceProbes();
+    CALLBACK_AND_RETURN_IF(guess_poses.empty(), finish_cb_, Pose,
+                           "No guess pose was given and the map's place recognition index did not recognize this "
+                           "place. The map has to have been saved with use_vpr.");
+  }
+
   LocalizationResult result;
-  CALLBACK_AND_RETURN_IF(!localizer->Localize(guess_pose_, images_, result), finish_cb_, Pose,
+  CALLBACK_AND_RETURN_IF(!localizer->Localize(guess_poses, images_, result), finish_cb_, Pose,
                          "Can't localize in map using provided image and guess");
 
   CALLBACK_AND_RETURN_IF(!result.slam_from->SelectHeadKeyframe(result.from_keyframe_id, timestamp_ns_), finish_cb_,
@@ -166,6 +180,7 @@ void AsyncSlam::LocalizeInMapCmd::Execute(AsyncSlam& async_slam, FrameId, const 
       AddFakeKeyframeForLocalizedPose(*async_slam.slam_, result.from_keyframe_id, result.pose_in_slam, timestamp_ns_,
                                       images_, FrameInformationString(images_));
       AddFakeKeyframeForLastTailPose(*async_slam.slam_, async_slam.tail_);
+      async_slam.vpr_wants_frame_ = async_slam.slam_->VprHeadNeedsImage();
     }
   }
   CALLBACK_AND_RETURN_IF(!tail_updated, finish_cb_, Pose,

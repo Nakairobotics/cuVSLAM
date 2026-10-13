@@ -24,6 +24,7 @@
 #include "slam/map/database/lmdb_slam_database.h"
 #include "slam/map/spatial_index/lsi_grid.h"
 #include "slam/slam/slam_check_hypothesis.h"
+#include "slam/vpr/vpr_sof_image.h"
 
 namespace cuvslam::slam {
 
@@ -86,22 +87,137 @@ bool LocalizerAndMapper::SetPoseGraphOptimizerOptions(const PoseGraphOptimizerOp
 
 PoseGraphOptimizerOptions LocalizerAndMapper::GetPoseGraphOptimizerOptions() const { return pg_options_; }
 
+void LocalizerAndMapper::RegisterRemoveNodeCB() {
+  // PoseGraph holds a single removal callback, so this one serves both keep_track_poses_ and VPR.
+  const PoseGraph::RemoveNodeCB remove_node_cb =
+      [this](const KeyFrameId keyframe_id, const KeyFrameId instead_keyframe_id, const Isometry3T& to_instead) -> void {
+    if (keep_track_poses_) {
+      ChangeKeyframeInfo change_keyframe_info;
+      change_keyframe_info.new_node = instead_keyframe_id;
+      change_keyframe_info.old_node_to_new = to_instead;
+      keyframe_removed_[keyframe_id] = change_keyframe_info;
+    }
+    if (vpr_map_) {
+      vpr_map_->OnKeyframeRemoved(keyframe_id, instead_keyframe_id);
+    }
+  };
+  map_.pose_graph_.RegisterRemoveNodeCB(remove_node_cb);
+}
+
 void LocalizerAndMapper::SetKeepTrackPoses(bool keep_track_poses) {
   // if true - CalcFramePose() will working
   keep_track_poses_ = keep_track_poses;
 
   if (keep_track_poses_) {
-    PoseGraph::RemoveNodeCB remove_node_cb = [&](KeyFrameId keyframe_id, KeyFrameId instead_keyframe_id,
-                                                 const Isometry3T& to_instead) -> void {
-      ChangeKeyframeInfo change_keyframe_info;
-      change_keyframe_info.new_node = instead_keyframe_id;
-      change_keyframe_info.old_node_to_new = to_instead;
-      keyframe_removed_[keyframe_id] = change_keyframe_info;
-      // SlamStdout("\nkeyframe_removed_[%zd]={%zd, %zd}", keyframe_id, change_keyframe_info.new_node,
-      // change_keyframe_info.old_node_to_new);
-    };
-    map_.pose_graph_.RegisterRemoveNodeCB(remove_node_cb);
+    RegisterRemoveNodeCB();
   }
+}
+
+void LocalizerAndMapper::SetVprOptions(const vpr::VprOptions& options) {
+  if (!options.enabled) {
+    vpr_map_.reset();
+    return;
+  }
+  SetVprMap(std::make_unique<vpr::VprMap>(options));
+}
+
+void LocalizerAndMapper::SetVprMap(std::unique_ptr<vpr::VprMap> map) {
+  vpr_map_ = std::move(map);
+  if (vpr_map_) {
+    RegisterRemoveNodeCB();
+  }
+}
+
+bool LocalizerAndMapper::IsVprEnabled() const { return vpr_map_ && vpr_map_->Enabled(); }
+
+size_t LocalizerAndMapper::GetVprMapSize() const { return vpr_map_ ? vpr_map_->Size() : 0; }
+
+bool LocalizerAndMapper::VprHeadNeedsImage() const {
+  if (!IsVprEnabled()) {
+    return false;
+  }
+  KeyFrameId head = InvalidKeyFrameId;
+  if (!map_.pose_graph_.GetHeadKeyframe(head) || head == InvalidKeyFrameId) {
+    return false;
+  }
+  return !vpr_map_->HasImage(head);
+}
+
+bool LocalizerAndMapper::AddVprFrame(const vpr::VprImage& image, const int64_t timestamp_ns) {
+  if (!IsVprEnabled()) {
+    return false;
+  }
+  KeyFrameId head = InvalidKeyFrameId;
+  if (!map_.pose_graph_.GetHeadKeyframe(head) || head == InvalidKeyFrameId) {
+    // Nothing mapped yet; drop the frame, the caller offers one every frame.
+    return false;
+  }
+  return vpr_map_->AddFrame(head, timestamp_ns, image);
+}
+
+vpr::VprPlace LocalizerAndMapper::RecognizePlace(const vpr::VprImage& image) {
+  const std::vector<vpr::VprPlace> places = RecognizePlaces(image, 1);
+  return places.empty() ? vpr::VprPlace{} : places.front();
+}
+
+std::vector<vpr::VprPlace> LocalizerAndMapper::RecognizePlaces(const vpr::VprImage& image, size_t max_results) {
+  std::vector<vpr::VprPlace> places;
+  if (!IsVprEnabled()) {
+    return places;
+  }
+
+  places = vpr_map_->QueryTopK(image, max_results);
+  for (auto it = places.begin(); it != places.end();) {
+    // Read the pose from the pose graph so it reflects loop closures.
+    const Isometry3T* pose = map_.pose_graph_hypothesis_.GetKeyframePose(it->node_id);
+    if (pose == nullptr) {
+      it = places.erase(it);  // node merged away since the query
+      continue;
+    }
+    it->pose = *pose;
+    ++it;
+  }
+  return places;
+}
+
+std::vector<vpr::VprPlace> LocalizerAndMapper::RecognizeLoopClosurePlaces(const vpr::VprImage& image) {
+  KeyFrameId head = InvalidKeyFrameId;
+  if (!IsVprEnabled() || !map_.pose_graph_.GetHeadKeyframe(head) || head == InvalidKeyFrameId) {
+    return {};
+  }
+  const int64_t head_timestamp_ns = map_.pose_graph_.GetKeyframe(head).keyframe_info.timestamp_ns;
+
+  // Rank every place: the recent past fills the top of the ranking and is skipped below.
+  std::vector<vpr::VprPlace> candidates;
+  for (const vpr::VprPlace& place : RecognizePlaces(image, GetVprMapSize())) {
+    // Skip the recent past; future-stamped places were mapped by another session.
+    const int64_t age_ns = head_timestamp_ns - place.timestamp_ns;
+    if (age_ns >= 0 && age_ns < kLoopClosureVprMinAgeNs) {
+      continue;
+    }
+    candidates.push_back(place);
+    if (candidates.size() == kLoopClosureVprCandidates) {
+      break;
+    }
+  }
+  return candidates;
+}
+
+bool LocalizerAndMapper::PutVprMapToDatabase() {
+  if (!IsVprEnabled() || !map_.database_ || map_.database_->IsReadOnly()) {
+    return true;
+  }
+  return map_.database_->SetSingleton(SlamDatabaseSingleton::VprMap, 0,
+                                      [&](BlobWriter& writer) { return vpr_map_->ToBlob(writer); });
+}
+
+void LocalizerAndMapper::GetVprMapFromDatabase() {
+  if (!IsVprEnabled() || !map_.database_) {
+    return;
+  }
+  // A map saved without VPR has none.
+  map_.database_->TryGetSingleton(SlamDatabaseSingleton::VprMap,
+                                  [&](const BlobReader& reader) { return vpr_map_->FromBlob(reader); });
 }
 
 bool LocalizerAndMapper::GetKeepTrackPoses() const { return keep_track_poses_; }
@@ -220,6 +336,7 @@ bool LocalizerAndMapper::AttachToExistingReadOnlyDatabase(const std::string& pat
     SlamStderr("Failed to attach to existing read only database \"%s\"", url);
     return false;
   }
+  GetVprMapFromDatabase();
   return true;
 #else
   SlamStderr("AttachToExistingReadOnlyDatabase is not implemented for databases other than LMDB.");
@@ -252,7 +369,12 @@ bool LocalizerAndMapper::AttachToNewDatabaseSaveMapAndDetach(const std::string& 
   if (!AttachToNewDatabase(path)) {
     return false;
   }
+  const bool vpr_saved = PutVprMapToDatabase();
   map_.DetachDatabase(true);
+  if (!vpr_saved) {
+    SlamStderr("Failed to save the place recognition map to %s.\n", path.c_str());
+    return false;
+  }
   SlamStdout("Successfully copied Slam Database %s.\n", path.c_str());
   return true;
 #else
@@ -261,10 +383,13 @@ bool LocalizerAndMapper::AttachToNewDatabaseSaveMapAndDetach(const std::string& 
 #endif
 }
 
-void LocalizerAndMapper::DetachDatabase() { map_.DetachDatabase(false); }
+void LocalizerAndMapper::DetachDatabase() {
+  PutVprMapToDatabase();
+  map_.DetachDatabase(false);
+}
 
 void LocalizerAndMapper::DetectLoopClosure(const ILoopClosureSolver& loop_closure_solver, const Images& images,
-                                           const Isometry3T& world_from_rig_guess, LoopClosureStatus& status) const {
+                                           const Isometry3T& world_from_rig_guess, LoopClosureStatus& status) {
   TRACE_EVENT ev = profiler_domain_.trace_event("LC()", profiler_color_);
 
   status = LoopClosureStatus();
@@ -275,6 +400,14 @@ void LocalizerAndMapper::DetectLoopClosure(const ILoopClosureSolver& loop_closur
   task.loop_closure_task.pose_graph_hypothesis = map_.pose_graph_hypothesis_.MakeCopy();
   task.loop_closure_task.guess_world_from_rig = world_from_rig_guess;
   map_.pose_graph_.GetHeadKeyframe(task.loop_closure_task.pose_graph_head);
+
+  if (loop_closure_solver.WantsVprCandidates() && IsVprEnabled()) {
+    const vpr::VprImage vpr_image = vpr::MakeVprImageFromImages(images);
+    if (!vpr_image.Empty()) {
+      task.loop_closure_task.vpr_candidates = RecognizeLoopClosurePlaces(vpr_image);
+    }
+  }
+
   const LSIGrid& lsi = *map_.landmarks_spatial_index_;
   SlamCheckHypothesis(lsi, &loop_closure_solver, rig_, map_.feature_descriptor_ops_.get(), task);
 
