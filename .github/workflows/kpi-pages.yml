@@ -39,10 +39,21 @@ jobs:
           RUNNER_STORAGE_ROOT: ${{ vars.RUNNER_STORAGE_ROOT }}
         run: |
           history="${RUNNER_STORAGE_ROOT:?RUNNER_STORAGE_ROOT must be set}/cuvslam-ci/kpi-history"
+          # Runner storage is mounted asynchronously after a fresh runner boots, and this job
+          # reaches it seconds after start, unlike eval which reads it after the build.
+          waited=0
+          while [ ! -d "$history" ] && [ "$waited" -lt 300 ]; do
+            sleep 5
+            waited=$((waited + 5))
+          done
           if [ ! -d "$history" ]; then
-            echo "::error::No KPI history at $history"
+            echo "::error::No KPI history at $history after waiting ${waited}s"
+            findmnt -T "$RUNNER_STORAGE_ROOT" || true
+            ls -la "$RUNNER_STORAGE_ROOT" "$RUNNER_STORAGE_ROOT/cuvslam-ci" || true
             exit 1
           fi
+          echo "KPI history available after ${waited}s at $history"
+          findmnt -T "$history" || true
           rm -rf kpi-history
           mkdir kpi-history
           for dir in "$history"/*/; do
