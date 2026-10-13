@@ -111,10 +111,11 @@ class EvaluationTests(unittest.TestCase):
         _, _, warnings = evaluation.frame_conversion(self.args("--gt-frame", "imu0", "--allow-missing-extrinsics",
                                                              "--alignment", "initial-poses"))
         self.assertIn("cannot generally recover", warnings[0])
-        with self.assertRaisesRegex(ValueError, "initial-window"):
-            evaluation.frame_conversion(self.args("--gt-frame", "imu0", "--allow-missing-extrinsics", "--alignment", "none"))
+        _, _, warnings = evaluation.frame_conversion(self.args("--gt-frame", "imu0", "--allow-missing-extrinsics",
+                                                             "--alignment", "none"))
+        self.assertTrue(warnings)  # A shared world does not resolve missing sensor calibration.
 
-    def test_calibrated_default_applies_extrinsic_without_world_fit(self):
+    def test_calibrated_shared_world_needs_no_fit(self):
         # Camera-to-body conversion has both a 90-degree rotation and a lever arm.
         self.write("estimate.txt", "0 0 0 0 0 0 0 1\n1 1 0 0 0 0 0 1\n2 2 0 0 0 0 0 1\n")
         half = np.sqrt(0.5)
@@ -127,19 +128,69 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(report["alignment"]["fit_pose_count"], 0)
         self.assertAlmostEqual(report["metrics"]["ate_rmse_m"], 0)
         self.assertAlmostEqual(report["metrics"]["are_rmse_deg"], 0)
-        # A known world offset stays in the error; calibration must not trigger a fit.
-        self.write("gt.txt", "".join(f"{i} {i + 8} 0 0 0 0 {half} {half}\n" for i in range(3)))
-        args.gt_world = "different-world"
-        report, _ = evaluation.evaluate(args)
-        self.assertEqual(report["status"], "provisional")
-        self.assertAlmostEqual(report["metrics"]["ate_rmse_m"], 5)
-        np.testing.assert_array_equal(report["alignment"]["gt_world_from_estimate_world"], np.eye(4))
-        for method in ("initial-poses", "initial-positions"):
-            args.alignment = method
-            with self.subTest(method=method), self.assertRaisesRegex(ValueError, "reserved"):
-                evaluation.evaluate(args)
         args.allow_missing_extrinsics = True
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            evaluation.evaluate(args)
+
+    def calibrated_world_fixture(self):
+        # Noncommuting world/sensor rotations plus a rotating lever arm exercise the full CLI pipeline.
+        gt = np.array([pose(i * 25, (i, i*i/2, 0.2*i)) for i in range(6)])
+        sensor = pose(70, (0.5, -0.3, 0.2), axis=(1, 0, 0))
+        world = pose(-145, (4, -2, 1), axis=(0, 1, 0))
+        estimated = evaluation.inverse(world) @ gt @ evaluation.inverse(sensor)
+        for name, trajectory in (("estimate.txt", estimated), ("gt.txt", gt)):
+            self.write(name, "\n".join(" ".join(map(str, p[:3].flatten())) for p in trajectory) + "\n")
+        times = self.write("times.txt", "0\n0.5\n1\n1.5\n2\n2.5\n")
+        for name, transform in (("camera.yaml", evaluation.inverse(sensor)), ("body.yaml", np.eye(4))):
+            self.write(name, json.dumps({"T_BS": {"rows": 4, "cols": 4, "data": transform.flatten().tolist()}}))
+        args = self.args("--estimate-format", "kitti", "--gt-format", "kitti",
+                         "--estimate-timestamps", str(times), "--gt-timestamps", str(times),
+                         "--gt-frame", "body", "--gt-world", "gt-world",
+                         "--estimate-sensor-yaml", str(self.root / "camera.yaml"),
+                         "--gt-sensor-yaml", str(self.root / "body.yaml"))
+        return args, world
+
+    def test_calibrated_different_worlds_are_registered(self):
+        args, world = self.calibrated_world_fixture()
+        for method in ("auto", "initial-poses", "initial-positions"):
+            with self.subTest(method=method):
+                args.alignment = method
+                report, _ = evaluation.evaluate(args)
+                self.assertEqual(report["status"], "ok")
+                self.assertEqual(report["alignment"]["fit_pose_count"], 3)
+                self.assertEqual(report["alignment"]["scale"], 1)
+                self.assertEqual(len(report["frames"]["calibration_sources"]), 2)
+                np.testing.assert_allclose(report["alignment"]["gt_world_from_estimate_world"], world, atol=1e-12)
+                self.assertLess(report["metrics"]["ate_rmse_m"], 1e-10)
+                self.assertLess(report["metrics"]["are_rmse_deg"], 1e-10)
+        args.alignment = "none"
+        report, _ = evaluation.evaluate(args)
+        self.assertEqual(report["status"], "provisional")
+        self.assertGreater(report["metrics"]["ate_rmse_m"], 1)
+        self.assertGreater(report["metrics"]["are_rmse_deg"], 100)
+
+    def test_known_world_transform_is_applied_without_fit(self):
+        args, world = self.calibrated_world_fixture()
+        transform = self.write("world.json", json.dumps(world.tolist()))
+        args.gt_world_from_estimate_world = transform
+        report, _ = evaluation.evaluate(args)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["alignment"]["method"], "known")
+        self.assertEqual(report["alignment"]["fit_pose_count"], 0)
+        self.assertEqual(report["alignment"]["transform_source"], evaluation.file_record(transform))
+        self.assertLess(report["metrics"]["ate_rmse_m"], 1e-10)
+        self.assertLess(report["metrics"]["are_rmse_deg"], 1e-10)
+        # A supplied transform is authoritative; no additional fit may hide its offset.
+        world[0, 3] += 5
+        transform.write_text(json.dumps(world.tolist()))
+        report, _ = evaluation.evaluate(args)
+        self.assertAlmostEqual(report["metrics"]["ate_rmse_m"], 5)
+        args.alignment = "initial-poses"
+        with self.assertRaisesRegex(ValueError, "do not also fit"):
+            evaluation.evaluate(args)
+        args.alignment = "known"
+        args.gt_world_from_estimate_world = None
+        with self.assertRaisesRegex(ValueError, "requires"):
             evaluation.evaluate(args)
 
     def test_association_overlap_tolerance_ties_and_uniqueness(self):
@@ -209,9 +260,8 @@ class EvaluationTests(unittest.TestCase):
     def test_initial_window_is_fixed_and_late_drift_remains(self):
         self.write("estimate.txt", "0 0 0 0 0 0 0 1\n0.5 1 0 0 0 0 0 1\n1 2 0 0 0 0 0 1\n2 13 0 0 0 0 0 1\n")
         self.write("gt.txt", "0 0 0 0 0 0 0 1\n0.5 1 0 0 0 0 0 1\n1 2 0 0 0 0 0 1\n2 3 0 0 0 0 0 1\n")
-        report, errors = evaluation.evaluate(self.args("--gt-frame", "imu0", "--allow-missing-extrinsics",
-                                                        "--alignment", "initial-poses"))
-        self.assertEqual(report["status"], "provisional")
+        report, errors = evaluation.evaluate(self.args("--gt-world", "gt-world"))
+        self.assertEqual(report["status"], "ok")
         self.assertEqual(report["alignment"]["fit_pose_count"], 3)
         self.assertEqual(report["alignment"]["fit_end_ns"], 10**9)
         self.assertAlmostEqual(report["metrics"]["ate_rmse_m"], 5)
@@ -223,7 +273,7 @@ class EvaluationTests(unittest.TestCase):
         report, _ = evaluation.evaluate(self.args("--time-offset", "10", "--alignment", "none"))
         self.assertEqual(report["metrics"]["ate_rmse_m"], 0)
         self.assertEqual(report["association"]["estimate_time_offset_ns"], 10**10)
-        report, _ = evaluation.evaluate(self.args("--time-offset", "10", "--gt-world", "other"))
+        report, _ = evaluation.evaluate(self.args("--time-offset", "10", "--gt-world", "other", "--alignment", "none"))
         self.assertEqual(report["status"], "provisional")
         self.assertIn("unresolved world offset", report["warnings"][0])
         self.assertEqual(report["alignment"]["fit_pose_count"], 0)

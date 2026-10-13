@@ -226,9 +226,6 @@ def sensor_matrix(path: Path) -> np.ndarray:
 def frame_conversion(args: argparse.Namespace) -> tuple[np.ndarray, list[dict], list[str]]:
     """Return T_estimate_sensor_from_gt_sensor, for right multiplication of estimates."""
     sources, warnings = [], []
-    if args.alignment != "none" and not args.allow_missing_extrinsics:
-        raise ValueError("world alignment is reserved for --allow-missing-extrinsics; "
-                         "use --alignment none with available calibration or a known same-sensor frame")
     yaml_paths = (args.estimate_sensor_yaml, args.gt_sensor_yaml)
     if args.allow_missing_extrinsics and args.estimate_frame == args.gt_frame:
         raise ValueError("missing-extrinsics fallback requires different physical frames")
@@ -247,8 +244,6 @@ def frame_conversion(args: argparse.Namespace) -> tuple[np.ndarray, list[dict], 
     elif args.estimate_frame == args.gt_frame:
         transform = np.eye(4)
     elif args.allow_missing_extrinsics:
-        if args.alignment not in ("initial-poses", "initial-positions"):
-            raise ValueError("missing-extrinsics fallback requires an explicit initial-window alignment")
         transform = np.eye(4)
         warnings.append("PROVISIONAL: physical frames differ and extrinsics are unavailable. Initial-window "
                         "world alignment cannot generally recover a missing camera/body extrinsic; "
@@ -279,9 +274,21 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[tuple]]:
     fit_ids = np.array([], dtype=int)
     diagnostics = {}
     transform = np.eye(4)
-    if args.alignment != "none":
+    method = args.alignment
+    if args.gt_world_from_estimate_world:
+        if method not in ("auto", "known"):
+            raise ValueError("a supplied world transform requires --alignment auto or known; do not also fit it")
+        method = "known"
+    elif method == "auto":
+        method = "none" if args.estimate_world == args.gt_world else "initial-poses"
+    if method == "known":
+        if not args.gt_world_from_estimate_world:
+            raise ValueError("--alignment known requires --gt-world-from-estimate-world")
+        transform = rigid_matrix(json.loads(args.gt_world_from_estimate_world.read_text()))
+        diagnostics["transform_source"] = file_record(args.gt_world_from_estimate_world)
+    elif method.startswith("initial"):
         fit_ids = np.flatnonzero(matched_times - matched_times[0] <= window_ns)
-        transform, diagnostics = fit_alignment(matched_est[fit_ids], matched_gt[fit_ids], args.alignment)
+        transform, diagnostics = fit_alignment(matched_est[fit_ids], matched_gt[fit_ids], method)
     elif args.estimate_world != args.gt_world:
         warnings.append("PROVISIONAL: world frames differ and no world alignment was applied. "
                         "Extrinsic conversion alone does not establish a shared world; these unaligned "
@@ -297,7 +304,10 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[tuple]]:
                          "initial positions set the origin without fitting later drift.",
         "initial-positions": "Initial positions set the world frame without fitting later drift; "
                              "non-collinearity is required.",
-        "none": "Apply the calibrated or known identity physical-frame conversion only; no world alignment.",
+        "known": "Apply the supplied rigid world registration without fitting trajectory poses.",
+        "none": ("The declared world frames already coincide; no world registration is needed."
+                 if args.estimate_world == args.gt_world else
+                 "Explicit unaligned diagnostic; residuals include the unresolved world offset."),
     }
     report = {
         "schema_version": 1, "status": "provisional" if any(warning.startswith("PROVISIONAL:") for warning in warnings) else "ok",
@@ -315,8 +325,7 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[tuple]]:
             "estimate_world": args.estimate_world, "gt_world": args.gt_world,
             "evaluation_sensor": args.gt_frame if not args.allow_missing_extrinsics else "unresolved (see warnings)",
             "estimate_from_gt": conversion.tolist(), "calibration_sources": calibration,
-            "conversion_rule": ("T_W_E @ T_E_G; no world alignment" if args.alignment == "none" else
-                                "identity physical-frame assumption; then T_Wgt_West @ estimate"),
+            "conversion_rule": "T_Wgt_West @ (T_West_E @ T_E_G)",
         },
         "association": {
             "method": "all candidate pairs sorted by (absolute dt, estimate index, GT index); greedy one-to-one; "
@@ -327,9 +336,10 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[tuple]]:
             **counts,
         },
         "alignment": {
-            "method": args.alignment, "scale": 1.0, "rationale": args.alignment_reason or reasons[args.alignment],
-            "policy": "missing-extrinsics-fallback" if args.allow_missing_extrinsics else "extrinsics-only",
-            "requested_initial_window_seconds": window_ns / 1e9 if args.alignment.startswith("initial") else None,
+            "method": method, "requested_method": args.alignment,
+            "scale": 1.0, "rationale": args.alignment_reason or reasons[method],
+            "policy": "missing-extrinsics-fallback" if args.allow_missing_extrinsics else "calibrated-common-world",
+            "requested_initial_window_seconds": window_ns / 1e9 if method.startswith("initial") else None,
             "fit_pose_count": len(fit_ids), "fit_start_ns": int(matched_times[fit_ids[0]]) if len(fit_ids) else None,
             "fit_end_ns": int(matched_times[fit_ids[-1]]) if len(fit_ids) else None,
             "fit_poses_included_in_metrics": bool(len(fit_ids)), "gt_world_from_estimate_world": transform.tolist(),
@@ -373,11 +383,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--estimate-from-gt", type=Path, help="JSON 4x4 T_E_G: maps GT sensor points to estimate sensor")
     parser.add_argument("--estimate-sensor-yaml", type=Path, help="T_BS for estimate sensor; requires PyYAML")
     parser.add_argument("--gt-sensor-yaml", type=Path, help="T_BS for GT sensor, SAME reference B as estimate YAML")
-    parser.add_argument("--allow-missing-extrinsics", action="store_true", help="explicit provisional initial-window fallback")
+    parser.add_argument("--allow-missing-extrinsics", action="store_true", help="explicit provisional identity sensor conversion")
     parser.add_argument("--time-offset", default="0", help="seconds ADDED to estimate times; no automatic clock fitting")
     parser.add_argument("--max-time-difference", default="0.01", help="association tolerance, seconds (default: 0.01)")
-    parser.add_argument("--alignment", choices=("none", "initial-poses", "initial-positions"), default="none",
-                        help="default: none; initial-window alignment requires --allow-missing-extrinsics")
+    parser.add_argument("--alignment", choices=("auto", "none", "known", "initial-poses", "initial-positions"), default="auto",
+                        help="default: auto; use a supplied world transform, none for a declared shared world, "
+                             "otherwise initial-poses (after sensor conversion)")
+    parser.add_argument("--gt-world-from-estimate-world", type=Path,
+                        help="JSON 4x4 T_Wgt_West: known rigid world registration, applied on the left without fitting")
     parser.add_argument("--alignment-window", default="1.0", help="seconds from first matched estimate, inclusive; min 3 pairs")
     parser.add_argument("--alignment-reason", help="rationale for the selected alignment")
     parser.add_argument("--output-dir", type=Path, required=True, help="write evaluation.json and errors.csv; never overwrite")

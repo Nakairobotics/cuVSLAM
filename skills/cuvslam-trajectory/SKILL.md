@@ -119,20 +119,22 @@ nor cuVSLAM/CUDA. Inspect its `--help` for supported input formats and exact opt
 1. Identify each trajectory's physical frame (camera, body, IMU, or rig), world convention, pose direction,
    quaternion ordering, timestamp units, and calibration source. Inspect the actual exporter and calibration,
    including `sensor.yaml`; do not infer frames from filenames or tracking mode alone.
-2. If extrinsic calibration is available, convert physical frames with the full rigid extrinsic, including
-   rotation and translation, in the correct direction, and compare with `--alignment none` (the default).
-   Do not fit a world transform, reset either trajectory to its first pose, or substitute an aligned secondary
-   result for this calibrated comparison. If the physical frames already coincide, use their known identity
-   relationship and no world alignment.
-3. Use world alignment only as an explicit fallback when the required camera/body extrinsic cannot be found
-   or derived: `--allow-missing-extrinsics --alignment initial-poses --alignment-window 1.0`. Label that result
-   provisional; a world fit cannot generally recover the missing extrinsic. For this fallback, state the window,
-   check fit validity/residuals, and apply one fixed transform with scale 1 throughout.
-4. Associate timestamps within the overlapping interval and report exclusions. Preserve the actual world-frame
-   labels. Extrinsic calibration does not establish a shared world: if the worlds differ, still use the requested
-   extrinsics-only comparison, report its provisional unaligned ATE/ARE and world-offset limitation, and do not
-   add world alignment or relabel the worlds to suppress the warning. Such residuals are not isolated tracking
-   accuracy. A large value does not justify switching to an alignment fit.
+2. Convert physical frames with the full available rigid extrinsic, including rotation and translation, in the
+   correct direction. For known identical physical frames, use identity. Camera/body conversion acts on the
+   right and does not establish a shared world origin or orientation.
+3. **World registration is also required for evaluation when the world frames differ**, even with correct
+   extrinsics. Apply a known world transform with `--gt-world-from-estimate-world world.json` when available.
+   Otherwise use `--alignment initial-poses --alignment-window 1.0` after physical-frame conversion. Inspect
+   the fit diagnostics and apply one fixed SE(3) transform on the left, with scale 1, to all evaluated poses.
+   The helper defaults to `--alignment auto`: supplied world transform, no fit for a verified shared world,
+   otherwise initial-pose registration. Use `--alignment none` for tracking accuracy only when the worlds
+   already coincide. Preserve actual world labels; do not relabel them to bypass registration. Do not fit
+   scale, repeatedly realign, or enlarge the fit window to reduce later drift.
+4. Associate timestamps within the overlapping interval and report exclusions. If the required extrinsic cannot
+   be found or derived, `--allow-missing-extrinsics` permits a provisional comparison only: world registration
+   cannot generally recover missing sensor calibration. Do not omit available calibration. If the user explicitly
+   requests an unaligned diagnostic between different worlds, use `--alignment none`, label the residuals
+   provisional, and explain that they include arbitrary world offsets rather than isolated tracking error.
 5. Follow requested metrics. Otherwise report translation ATE RMSE in meters, rotation-angle ARE RMSE in degrees,
    and normalized ATE RMSE = `100 * ATE_RMSE / GT traveled distance` in percent. Report ARE in degrees unless
    the user defines a percentage denominator. Segment drift in `%` and `degrees/m` is a separate metric.

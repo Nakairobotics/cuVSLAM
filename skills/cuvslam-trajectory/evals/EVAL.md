@@ -19,10 +19,10 @@ Negative cases distinguish live-camera setup and tracking diagnosis.
   1 meter, ARE RMSE 30 degrees, normalized ATE RMSE 50 percent. Use NumPy, without installing cuVSLAM.
 - When frames differ and calibration is absent, label an explicitly requested initial-window comparison
   provisional and explain why a world transform cannot generally recover the missing extrinsic.
-- With available extrinsics, apply the full rigid conversion and use no world alignment or first-pose reset.
-  Preserve distinct world labels and report provisional unaligned residuals when world registration is unknown.
-- Permit an initial-window world fit only for explicitly unavailable physical-frame extrinsics; do not discard
-  available calibration to enable the fallback.
+- With available extrinsics, apply the full rigid conversion and independently register different world frames.
+  Use a known world transform when supplied, otherwise one fixed initial-window SE(3) fit with scale 1.
+  Use no registration only for a verified shared world or an explicitly requested provisional diagnostic.
+- Do not discard available calibration: a world fit cannot replace the physical-frame conversion.
 
 ## Notes
 
@@ -45,8 +45,8 @@ Extended evaluation requires a compatible CUDA runtime and PyCuVSLAM environment
 - ROS bag: convert with a verified mapping, replay the EDEX, and validate the resulting trajectory.
 - Replay-only request with GT present: stop after replay and validation; do not calculate metrics.
 - Replay-and-evaluate request: establish the exported rig frame and actual calibration, convert physical frames,
-  then associate and compare without world alignment. Use a provisional initial-window fit only when extrinsics
-  are unavailable. Report definitions, units, exclusions, world-offset limitations, and output paths.
+  then associate and register different worlds before computing ATE/ARE. Verify that later drift remains after
+  the fixed initial-window fit. Report definitions, units, exclusions, fit diagnostics, and output paths.
 
 Record dataset/product revisions, GPU/runtime, harness and model versions, transcripts, exit codes, and artifacts.
 Report baseline and with-skill results separately for smoke and extended runs. Never substitute synthetic or

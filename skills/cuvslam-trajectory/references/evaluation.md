@@ -33,18 +33,15 @@ Do not invent uniformly spaced timestamps.
 
 ```text
 converted estimate = T_We_E @ T_E_G
-compare converted estimate with GT directly (--alignment none)
+evaluated estimate = T_Wg_We @ converted estimate
+compare evaluated estimate with T_Wg_G
 ```
 
 Sensor/body conversion multiplies on the **right**, using the full rotation and lever-arm translation.
-When calibration is available, this skill uses that conversion alone: **do not apply world alignment**,
-including an initial-pose reset or a separate global fit. Known identical physical frames also use no alignment.
-World alignment is reserved for the explicit missing-extrinsics fallback described below.
-
-This is an evaluation policy, not a claim that extrinsics establish the world registration. If the estimate and
-GT have different worlds, the unaligned residual includes that world offset. Preserve their actual world labels
-and report the helper's provisional result and limitation; do not present it as isolated tracking accuracy or
-silently add an alignment to obtain smaller errors.
+World registration multiplies on the **left**. Both are needed when the physical frames and world frames differ;
+knowing camera/body extrinsics does not establish the world-to-world transform. This also applies to identical
+physical frames expressed in different worlds. A cuVSLAM local world and a dataset's GT world generally have
+different origins/orientations; their raw residuals can be large even with accurate tracking and calibration.
 
 For two calibration files whose `T_BS` matrices both refer to the same physical reference B:
 
@@ -77,18 +74,17 @@ python3 <skill-dir>/scripts/evaluate_trajectory.py \
     --gt-world 'EuRoC ground-truth world, right-handed' \
     --estimate-sensor-yaml /data/rec_05/mav0/cam0/sensor.yaml \
     --gt-sensor-yaml /data/rec_05/mav0/imu0/sensor.yaml \
-    --alignment none \
+    --alignment initial-poses --alignment-window 1.0 \
     --output-dir /data/rec_05/evaluation
 ```
 
 Only if the required extrinsics cannot be found or derived, explain the missing relationship and use
-`--allow-missing-extrinsics --alignment initial-poses --alignment-window 1.0` for a provisional initial-window
-comparison. This explicitly assumes identity for the missing conversion and emits a `provisional` status and
-limitation. The helper rejects world alignment when calibrated conversion or a known same-sensor relationship
-is available. Do not omit available calibration to enable this fallback. One world transform cannot generally replace a camera/body transform: a
-lever arm moves with sensor rotation, and a missing orientation extrinsic also produces motion-dependent error.
-Do not present these numbers as isolated tracking accuracy or claim the fit recovered the calibration. In an
-already calibrated dataset, failure to inspect available extrinsics is not a justification for this fallback.
+`--allow-missing-extrinsics` for a provisional comparison, with the world-registration choice made separately.
+This explicitly assumes identity for the missing conversion and emits a `provisional` status and limitation.
+Do not omit available calibration to enable this fallback. One world transform cannot generally replace a
+camera/body transform: a lever arm moves with sensor rotation, and a missing orientation extrinsic also produces
+motion-dependent error. Do not present these numbers as isolated tracking accuracy or claim the world fit
+recovered calibration. Failure to inspect available extrinsics is not a justification for this fallback.
 
 ## Timestamp association and coverage
 
@@ -105,21 +101,25 @@ A short common interval does not establish full recording coverage. Alignment po
 `errors.csv` records the matched row indices (zero-based, excluding comments), corrected estimate and GT times,
 time differences, translation errors, and rotation errors.
 
-## Alignment policy and scale
+## World registration and scale
 
-`--alignment none` is the default. With available extrinsics, apply only the physical-frame conversion, associate
-poses, and compute the metrics. Do not first reset the trajectories, fit their first poses/window, fit the entire
-trajectory, or optimize scale. With the same verified physical frame, use the identity conversion and no alignment.
+Evaluation requires a common world frame as well as a common physical frame. After applying the physical-frame
+conversion, choose world registration independently of whether sensor calibration was needed:
 
-Keep the estimate's and GT's actual world-frame labels. For `none`, matching labels declare a verified shared
-world. Different labels are accepted so the requested extrinsics-only residuals can be computed, but the report
-is `provisional` and warns that those values include an unresolved world offset. Do not change labels merely to
-make the report `ok`. Sensor extrinsics alone do not determine the world-to-world transform.
+- If the world-to-world transform is known, supply its 4x4 SE(3) JSON matrix with
+  `--gt-world-from-estimate-world world.json`. It maps estimate-world points to GT-world points and is applied
+  without fitting trajectory poses. Record its provenance; the helper saves its file path and SHA-256 hash.
+- If both trajectories already use the same verified world frame, use `--alignment none`.
+- Otherwise register the worlds using `--alignment initial-poses --alignment-window 1.0` by default.
+  This is required even when the camera/body extrinsics are available or the physical frames already coincide.
 
-World alignment is available **only with `--allow-missing-extrinsics`**, after establishing that the required
-physical-frame transform is unavailable. Both fallback modes keep scale exactly 1:
+`--alignment auto` is the helper default: use a supplied world transform (`known`), otherwise `none` for identical
+world labels, otherwise `initial-poses`. Matching labels declare a verified shared world; preserve the actual
+labels rather than changing them to control the result. A known transform cannot be combined with a fitted mode.
 
-| `--alignment` | Missing-extrinsics fallback method |
+Both fitted modes keep scale exactly 1:
+
+| `--alignment` | Fixed world-registration method |
 | --- | --- |
 | `initial-poses` | Mean of `R_gt @ R_est.T`, projected onto SO(3) by SVD; translation is `mean(p_gt - R_align @ p_est)`. Uses orientations even at rest or on a straight line. |
 | `initial-positions` | Rigid Kabsch fit on initial positions; requires at least 2 independent centered position directions. |
@@ -127,13 +127,17 @@ physical-frame transform is unavailable. Both fallback modes keep scale exactly 
 Use a declared initial window, normally `--alignment-window 1.0` seconds from the first matched estimate timestamp,
 inclusive. At least 3 pairs are required. Inspect fit residuals and conditioning, and record the actual fit count,
 interval, matrix, and rationale. Apply one fixed transform to all evaluated poses; do not continually realign or
-increase the window to improve the reported error. A fallback fit remains provisional because it does not recover
-a missing camera/body extrinsic or isolate tracking error. Similarity/Sim(3) scale fitting is not supported.
+increase the window to improve the reported error. Similarity/Sim(3) scale fitting is not supported.
+
+An explicitly requested `--alignment none` between different worlds is an unaligned diagnostic only. The helper
+labels it `provisional`: those ATE/ARE residuals include the unresolved world offset and are not isolated tracking
+accuracy. Missing physical-frame calibration also remains provisional after world registration. Neither a small
+aligned error nor a large unaligned error establishes whether calibration was applied correctly.
 
 ## Metrics and output
 
-Follow the user's requested definitions. Compute these errors after calibrated conversion alone, or after the
-explicit missing-extrinsics fallback. With unresolved world frames or extrinsics, label them provisional residuals:
+Follow the user's requested definitions. Compute these errors after physical-frame conversion and world
+registration. With unresolved world frames or extrinsics, label them provisional residuals:
 
 | Output | Definition |
 | --- | --- |
